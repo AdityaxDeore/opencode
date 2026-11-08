@@ -6,6 +6,7 @@ import { ephemeral } from "@opencode/schema/event"
 import type { Session } from "@opencode/schema/session"
 import type { Transport } from "@modelcontextprotocol/client"
 import { createHash } from "node:crypto"
+import path from "node:path"
 import { isDeepStrictEqual } from "node:util"
 import {
   Clock,
@@ -16,6 +17,7 @@ import {
   FiberSet,
   Latch,
   Layer,
+  Option,
   Schema,
   Scope,
   Semaphore,
@@ -25,9 +27,14 @@ import {
 import { FetchHttpClient } from "effect/http"
 import { makeLocationNode } from "@opencode/util/effect/app-node"
 import { httpFetch } from "@opencode/util/effect/app-node-platform"
+import { FSUtil } from "@opencode/util/fs-util"
+import { Global } from "@opencode/util/global"
+import { Hash } from "@opencode/util/hash"
+import { Config } from "../config.js"
 import { Credential } from "../credential.js"
 import { Bus } from "../bus.js"
 import { Environment } from "../environment/index.js"
+import { Flag } from "../flag.js"
 import { Form } from "../form.js"
 import { Integration } from "../integration.js"
 import { KeyedMutex } from "../effect/keyed-mutex.js"
@@ -81,7 +88,10 @@ export class ToolCallError extends Schema.TaggedError<ToolCallError>()("MCP.Tool
   message: Schema.String,
 }) {}
 
-const unavailable = (server: ServerName, status: Status) => {
+const unavailable = (server: ServerName, entry: ServerEntry) => {
+  if (entry.reconnecting)
+    return `MCP server "${server}" lost its connection (${entry.reconnecting.reason}) and is reconnecting. Try again shortly.`
+  const status = entry.status
   switch (status.status) {
     case "failed":
       return `MCP server "${server}" is not connected: ${status.error}. Reconnect it from /mcps.`
@@ -106,6 +116,15 @@ type ServerEntry = {
   // Set when a remote server is registered as an OAuth integration; the credential lives in the global store.
   integrationID?: Integration.ID
   registration?: State.Registration
+  // Tools offered while the connection has none: the last list of a connection that dropped on its own, or the
+  // disk-cached list of a server still starting. The next connect replaces it; a failure or an explicit stop drops it.
+  retained?: ReadonlyArray<McpClient.Tool>
+  // Set while the server reconnects after its connection dropped on its own. An explicit lifecycle operation clears
+  // it, which ends the reconnect loop that holds it.
+  reconnecting?: { reason: string }
+  // Reconnects since the last connection that stayed up longer than the longest delay, so a crash loop backs off too.
+  restarts: number
+  connectedAt?: number
 }
 
 // A client-hosted MCP server attached over a connection the client opened. Internal: never listed,
@@ -119,6 +138,39 @@ type AttachedEntry = {
 
 // How long a model call may wait for a server that is still connecting, counted from when it began.
 const STARTUP_GRACE_MS = 2_000
+
+// A connection that drops on its own is reopened after 1 s, doubling per attempt up to 30 s.
+const RECONNECT_DELAY_MS = 1_000
+const RECONNECT_MAX_DELAY_MS = 30_000
+// How long a tool call waits for a reconnect attempt already under way before it reports the server as reconnecting.
+const RECONNECT_CALL_WAIT = "10 seconds"
+
+// Last listed tools per server, keyed by everything that changes the connection (see `McpPool.key`).
+const CachedTools = Schema.fromJsonString(
+  Schema.Struct({
+    tools: Schema.Array(
+      Schema.Struct({
+        name: Schema.String,
+        title: Schema.optional(Schema.String),
+        description: Schema.optional(Schema.String),
+        inputSchema: Schema.StructWithRest(
+          Schema.Struct({
+            type: Schema.Literal("object"),
+            properties: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
+            required: Schema.optional(Schema.mutable(Schema.Array(Schema.String))),
+          }),
+          [Schema.Record(Schema.String, Schema.Unknown)],
+        ),
+        outputSchema: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
+        annotations: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
+        execution: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
+        _meta: Schema.optional(Schema.Record(Schema.String, Schema.Unknown)),
+      }),
+    ),
+  }),
+)
+const decodeCachedTools = Schema.decodeUnknownOption(CachedTools)
+const encodeCachedTools = Schema.encodeSync(CachedTools)
 
 // Bounds re-listing the tools of an attached connection that takes over the top of its stack.
 const FALLBACK_LIST_TIMEOUT = "5 seconds"
@@ -208,6 +260,10 @@ export const layer = (options?: Options) =>
       const credentials = yield* Credential.Service
       const fetch = yield* FetchHttpClient.Fetch
       const pool = yield* McpPool.Service
+      const configService = yield* Config.Service
+      const global = yield* Global.Service
+      const fsutil = yield* FSUtil.Service
+      const resilient = Flag.enabled("mcp_resilience").pipe(Effect.provideService(Config.Service, configService))
       const root = yield* Effect.scope
       const fork = yield* FiberSet.makeRuntime<never, void, never>()
       // Server scopes close in parallel on shutdown, so one slow server's stop grace does not delay
@@ -287,6 +343,14 @@ export const layer = (options?: Options) =>
         yield* entry.startup.await
         return { entry, client: entry.connection.client }
       })
+      // A call to a server that is reconnecting waits a little for an attempt already under way, rather than fail
+      // while a restarted process finishes its handshake. Between attempts it fails at once.
+      const reconnected = Effect.fnUntraced(function* (entry: ServerEntry) {
+        const attempt = entry.attempt
+        if (!entry.reconnecting || !attempt) return undefined
+        yield* attempt.settled.await.pipe(Effect.timeoutOption(RECONNECT_CALL_WAIT))
+        return entry.connection.client
+      })
 
       // The credential one start connects with: the integration's latest, or none. Read it once per start and
       // pass the result along, so anything keyed on it and the provider it builds agree on the account.
@@ -306,6 +370,88 @@ export const layer = (options?: Options) =>
           Effect.provideService(FetchHttpClient.Fetch, fetch),
         )
       })
+
+      // One file per connection identity, so a change to the command, URL, environment, headers or signed-in
+      // account reads a different file. Secrets reach the name only as fingerprints inside a one-way hash.
+      const toolsFile = Effect.fnUntraced(function* (entry: ServerEntry) {
+        const credential = yield* selectCredential(entry)
+        const { McpStdio } = yield* Effect.promise(() => import("./stdio.js"))
+        const key = McpPool.key({
+          config: entry.config,
+          cwd: entry.config.type === "local" ? McpStdio.resolveCwd(location.directory, entry.config.cwd) : undefined,
+          credential: credential?.id,
+          clientInfo: options?.clientInfo,
+        })
+        return path.join(
+          global.cache,
+          "mcp",
+          "tools",
+          `${Hash.sha256(JSON.stringify([location.workspaceID, key]))}.json`,
+        )
+      })
+
+      const loadTools = Effect.fnUntraced(function* (name: ServerName, entry: ServerEntry) {
+        if (entry.config.disabled || !(yield* resilient)) return
+        const text = yield* fsutil
+          .readFileStringSafe(yield* toolsFile(entry))
+          .pipe(Effect.orElseSucceed(() => undefined))
+        if (text === undefined) return
+        entry.retained = Option.getOrUndefined(decodeCachedTools(text))?.tools
+        if (entry.retained) yield* bus.publish(McpEvent.ToolsChanged, { server: name })
+      })
+
+      const saveTools = (entry: ServerEntry) =>
+        fork(
+          Effect.gen(function* () {
+            const tools = entry.connection.tools
+            if (!tools || !(yield* resilient)) return
+            yield* fsutil.writeWithDirs(yield* toolsFile(entry), encodeCachedTools({ tools }))
+          }).pipe(Effect.catch((error) => Effect.logWarning("failed to cache MCP tools", { error: error.message }))),
+        )
+
+      const dropRetained = Effect.fnUntraced(function* (name: ServerName, entry: ServerEntry) {
+        if (!entry.retained) return
+        entry.retained = undefined
+        yield* bus.publish(McpEvent.ToolsChanged, { server: name })
+      })
+
+      // A connection that went away on its own keeps offering its last tools and reconnects: at once after a connection
+      // that stayed up, then with growing delays, until it connects, auth fails or an explicit operation takes over.
+      // Runs under the server lock.
+      const drop = Effect.fnUntraced(function* (name: ServerName, entry: ServerEntry, reason: string) {
+        // A shared connection has already emptied its catalogs, so fall back to the last list read from it.
+        entry.retained = entry.connection.tools ?? entry.tagged?.source
+        const now = yield* Clock.currentTimeMillis
+        if (entry.connectedAt === undefined || now - entry.connectedAt >= RECONNECT_MAX_DELAY_MS) entry.restarts = 0
+        const reconnecting = { reason }
+        entry.reconnecting = reconnecting
+        entry.status = { status: "pending" }
+        yield* entry.connection.stop
+        yield* Effect.logWarning("mcp connection dropped, reconnecting", { server: name, reason })
+        yield* bus.publish(McpEvent.StatusChanged, { server: name })
+        if (entry.restarts === 0) {
+          entry.restarts = 1
+          yield* entry.connection.start
+        }
+        if (entry.reconnecting === reconnecting) fork(revive(name, entry, reconnecting))
+      })
+
+      const revive = (
+        name: ServerName,
+        entry: ServerEntry,
+        reconnecting: ServerEntry["reconnecting"],
+      ): Effect.Effect<void> =>
+        Effect.gen(function* () {
+          yield* Effect.sleep(
+            Math.min(RECONNECT_DELAY_MS * 2 ** Math.min(entry.restarts - 1, 16), RECONNECT_MAX_DELAY_MS),
+          )
+          const again = yield* Effect.suspend(() => {
+            if (entries.get(name) !== entry || entry.reconnecting !== reconnecting) return Effect.succeed(false)
+            entry.restarts += 1
+            return entry.connection.start.pipe(Effect.map(() => entry.reconnecting === reconnecting))
+          }).pipe(locks.withLock(name))
+          if (again) yield* revive(name, entry, reconnecting)
+        })
 
       const elicitation: McpClient.ElicitationHandler = {
         create: (input: {
@@ -411,6 +557,7 @@ export const layer = (options?: Options) =>
         const entry: ServerEntry = {
           config,
           status: { status: "pending" },
+          restarts: 0,
           startup: Latch.makeUnsafe(),
           attempt: { started, settled: Latch.makeUnsafe() },
           connection: (pooled ? share : McpConnection.make)({
@@ -441,6 +588,10 @@ export const layer = (options?: Options) =>
               }),
               connected: Effect.gen(function* () {
                 entry.status = { status: "connected" }
+                entry.retained = undefined
+                entry.reconnecting = undefined
+                entry.connectedAt = yield* Clock.currentTimeMillis
+                saveTools(entry)
                 yield* Effect.logInfo("mcp connected", { server: name, tools: entry.connection.tools?.length })
                 // Announce every list a consumer may read, since each reads them only on these events. A
                 // connection another Location already holds has loaded its prompts, and no later change
@@ -452,9 +603,17 @@ export const layer = (options?: Options) =>
               }),
               failed: (failure) =>
                 Effect.gen(function* () {
+                  // A reconnect keeps trying past failures other than auth, so the server stays pending with its tools.
+                  if (entry.reconnecting && failure.status === "failed") {
+                    entry.reconnecting.reason = failure.error
+                    entry.status = { status: "pending" }
+                    return yield* Effect.logWarning("mcp reconnect failed", { server: name, error: failure.error })
+                  }
                   entry.status = failure
+                  entry.reconnecting = undefined
                   yield* Effect.logWarning("mcp connect failed", { server: name, status: entry.status })
                   yield* bus.publish(McpEvent.StatusChanged, { server: name })
+                  yield* dropRetained(name, entry)
                 }),
               // Every start runs under the server lock, so the attempt read here is the one it began.
               settled: Effect.suspend(() => {
@@ -464,11 +623,20 @@ export const layer = (options?: Options) =>
               }),
               closed: (reason) =>
                 Effect.gen(function* () {
+                  if (yield* resilient) return yield* drop(name, entry, reason)
                   entry.status = { status: "failed", error: reason }
                   yield* entry.connection.stop
                   yield* bus.publish(McpEvent.StatusChanged, { server: name })
                 }),
-              changed: (kind) => bus.publish(changes[kind], { server: name }),
+              expired: Effect.gen(function* () {
+                if (!(yield* resilient)) return false
+                yield* drop(name, entry, "MCP session expired")
+                return true
+              }),
+              changed: (kind) => {
+                if (kind === "tools") saveTools(entry)
+                return bus.publish(changes[kind], { server: name })
+              },
             },
           }),
         }
@@ -478,7 +646,7 @@ export const layer = (options?: Options) =>
       // MCP.tools() runs every step and the tool registry compares tools by identity, so tag the
       // connection's list once per listing instead of on every read.
       const serverTools = (name: ServerName, entry: ServerEntry) => {
-        const source = entry.connection.tools
+        const source = entry.connection.tools ?? entry.retained
         if (!source) return []
         if (entry.tagged?.source !== source)
           entry.tagged = {
@@ -516,18 +684,21 @@ export const layer = (options?: Options) =>
           ),
         })
 
-      const disposeServer = Effect.fnUntraced(function* (entry: ServerEntry) {
+      const disposeServer = Effect.fnUntraced(function* (name: ServerName, entry: ServerEntry) {
+        entry.reconnecting = undefined
         yield* entry.connection.stop
+        yield* dropRetained(name, entry)
         if (entry.registration) yield* entry.registration.dispose
       })
 
       const replaceServer = Effect.fnUntraced(function* (name: ServerName, serverConfig: Mcp.ServerConfig) {
         const previous = entries.get(name)
-        if (previous) yield* disposeServer(previous)
+        if (previous) yield* disposeServer(name, previous)
         const entry = makeEntry(name, serverConfig, yield* Clock.currentTimeMillis)
         entries.set(name, entry)
         yield* Effect.gen(function* () {
           yield* register(name, entry)
+          yield* loadTools(name, entry)
           if (serverConfig.disabled) {
             entry.status = { status: "disabled" }
             yield* bus.publish(McpEvent.StatusChanged, { server: name })
@@ -541,7 +712,7 @@ export const layer = (options?: Options) =>
       })
 
       const removeServer = Effect.fnUntraced(function* (name: ServerName, entry: ServerEntry) {
-        yield* disposeServer(entry)
+        yield* disposeServer(name, entry)
         // Credentials are keyed by name + URL and intentionally survive removal for a later re-add.
         entries.delete(name)
         yield* bus.publish(McpEvent.StatusChanged, { server: name })
@@ -655,6 +826,11 @@ export const layer = (options?: Options) =>
             entries.set(name, makeEntry(name, server, started))
           }
           yield* Effect.forEach(entries, ([name, entry]) => register(name, entry), { discard: true })
+          // Read before any connection starts, so the first step already offers the cached tools.
+          yield* Effect.forEach(entries, ([name, entry]) => loadTools(name, entry), {
+            concurrency: "unbounded",
+            discard: true,
+          })
 
           // Initial connections stay asynchronous so one slow server does not block Location startup.
           for (const [name, entry] of entries) {
@@ -697,6 +873,7 @@ export const layer = (options?: Options) =>
             const entry = entries.get(name)
             if (!entry || entry.integrationID !== integrationID) return
             if (entry.status.status === "disabled") return
+            entry.reconnecting = undefined
             yield* entry.connection.stop
             yield* entry.connection.start
           }).pipe(locks.withLock(name))
@@ -759,6 +936,7 @@ export const layer = (options?: Options) =>
           yield* transition(
             Effect.gen(function* () {
               const entry = yield* requireServer(name)
+              entry.reconnecting = undefined
               yield* entry.connection.stop
               yield* entry.connection.start
             }).pipe(locks.withLock(name)),
@@ -769,9 +947,11 @@ export const layer = (options?: Options) =>
           yield* transition(
             Effect.gen(function* () {
               const entry = yield* requireServer(name)
+              entry.reconnecting = undefined
               yield* entry.connection.stop
               entry.status = { status: "disabled" }
               yield* bus.publish(McpEvent.StatusChanged, { server: name })
+              yield* dropRetained(name, entry)
             }).pipe(locks.withLock(name)),
           )
         }),
@@ -800,7 +980,8 @@ export const layer = (options?: Options) =>
           const now = yield* Clock.currentTimeMillis
           yield* Effect.all(
             Array.from(entries.values()).flatMap((entry) => {
-              if (entry.status.status !== "pending" || !entry.attempt) return []
+              // A server offering retained or cached tools has something to show; the step need not wait for it.
+              if (entry.status.status !== "pending" || !entry.attempt || entry.retained) return []
               const remaining = entry.attempt.started + STARTUP_GRACE_MS - now
               return remaining > 0 ? [entry.attempt.settled.await.pipe(Effect.raceFirst(Effect.sleep(remaining)))] : []
             }),
@@ -826,13 +1007,14 @@ export const layer = (options?: Options) =>
           if (client && (client.tools.some((tool) => tool.name === input.name) || !entries.has(server)))
             return yield* call(client.client).pipe(failed("client"))
           const target = yield* connected(server)
-          if (!target.client)
+          const live = target.client ?? (yield* reconnected(target.entry))
+          if (!live)
             return yield* new ToolCallError({
               server,
               tool: input.name,
-              message: unavailable(server, target.entry.status),
+              message: unavailable(server, target.entry),
             })
-          return yield* target.entry.connection.recovering(target.client, call).pipe(failed("server"))
+          return yield* target.entry.connection.recovering(live, call).pipe(failed("server"))
         }),
         instructions: Effect.fn("MCP.instructions")(function* () {
           return Array.from(entries)
@@ -929,6 +1111,9 @@ export function configured(options?: Options) {
       Form.node,
       Integration.node,
       Credential.node,
+      Config.node,
+      Global.node,
+      FSUtil.node,
       httpFetch,
       McpPool.node,
     ],
